@@ -1,8 +1,14 @@
 use std::io;
-use std::fs::File;
+use std::io::*;
+use std::fs::{File, create_dir_all};
+use std::path::{Path, PathBuf};
+use std::fmt::Display;
+use std::thread;
 use crossterm::*;
 use ratatui::*;
 use simplelog::*;
+use dirs::home_dir;
+
 
 use ratatui::{
     widgets::{Block, Borders, Paragraph},
@@ -37,12 +43,14 @@ const BORDER_COLOR: Color = Color::White;
 const ACTIVE_TITLE_COLOR: Color = Color::Green;
 const INACTIVE_TITLE_COLOR: Color = Color::Blue;
 
+const DATA_DIRECTORY: &str = ".local/share/termite/";
+
 
 fn main() {
     WriteLogger::init(
         LevelFilter::Info,
         Config::default(),
-        File::create("termite.log").unwrap(),
+        File::create("termite.log").expect("failed to create log file"),
     ).unwrap();
 
     log::info!("Launching Termite...");
@@ -77,57 +85,78 @@ impl InputState {
 #[derive(Debug)]   // create default constructor and debug printing
 struct App {
     exit: bool,             // should the program exit?
+    name: String,
     state: InputState,         // how should it look?
+    loaded_pool_index: usize,
+    pool_file: PathBuf,
+    pool: Vec<String>,
+    pool_index: usize,
     lines: u16,   // how many history lines are visible?
     width: u16,
     margin: u16,
     title: String,
     input: String,
-    cursor_index: usize,
-    bound: u16
+    ignore_history_input: String,
+    cursor_index: usize
 }
 
 impl Default for App {
     fn default() -> Self {
         let default_state = InputState::Text;
-        let input = String::from(default_state.filename());
+        let mut pool_file = home_dir().expect("Failed to find home directory");
+        pool_file.push(DATA_DIRECTORY);
+        pool_file.push(default_state.filename());
+        log::info!("Reading from {}", pool_file.display().to_string());
+        let input = String::from(DATA_DIRECTORY.to_string() + default_state.filename());
+        let ignore_history_input = String::from(DATA_DIRECTORY.to_string() + default_state.filename());
         let cursor_index = input.len();
-        let bound = cursor_index;
         Self {
             exit: false,
+            name: "Termite".to_string(),
             state: default_state,
+            loaded_pool_index: 0,
+            pool_file,
+            pool: Vec::new(),
+            pool_index: 0,
             lines: 3,
             width: 10,
             margin: 3,
             title: "Command Line:".to_string(),
             input,
-            cursor_index,
-            bound: 10
+            ignore_history_input,
+            cursor_index
         }
     }
 }
 
 impl App {
 
-    fn get_autocomplete_pool(self) {
-        match self.state {
-            InputState::Path => {  }
-            _ => {}
-        };
-    }
-
-    fn open_file(self) {
-        
-    }
-
-
     fn exit(&mut self) {
-        self.exit = true
+        //self.save_temp_pool();
+        if self.input == "" {
+            self.exit = true;
+        } else {
+            self.wipe();
+        }
     }
 
     fn submit(&mut self) {
+        if self.input.len() > 0 {
+            self.pool.push(self.input.clone());
+            self.append_to_pool();
+            self.wipe();
+        }
+    }
+
+    fn wipe(&mut self) {
+        self.pool_index = self.pool.len();
         self.input.clear();
-        self.cursor_index = 0
+        self.ignore_history_input = self.input.clone();
+        self.correct_cursor();
+    }
+
+    fn correct_cursor(&mut self) {
+        self.cursor_index = self.input.len()
     }
 
     fn length_within_bounds(&self) -> bool {
@@ -136,6 +165,25 @@ impl App {
 
     fn cursor_at_end(&self) -> bool {
         self.cursor_index == self.input.len()
+    }
+
+    fn down(&mut self) {
+        if self.pool_index == self.pool.len() - 1 {
+            self.pool_index += 1;
+            self.input = self.ignore_history_input.clone();
+        } else if self.pool_index < self.pool.len() - 1 {
+            self.pool_index += 1;
+            self.input = self.pool[self.pool_index].clone();
+        }
+        self.correct_cursor();
+    }
+
+    fn up(&mut self) {
+        if self.pool_index > 0 {
+            self.pool_index -= 1;
+            self.input = self.pool[self.pool_index].clone();
+        }
+        self.correct_cursor();
     }
 
     fn left(&mut self) {
@@ -155,7 +203,7 @@ impl App {
     }
 
     fn end(&mut self) {
-        self.cursor_index = self.input.len()
+        self.correct_cursor();
     }
 
     fn backspace(&mut self) {
@@ -183,14 +231,61 @@ impl App {
                 self.input.insert(self.cursor_index, c);
             }
             self.cursor_index += 1;
-        } else {
-
+            self.ignore_history_input = self.input.clone();
+            self.pool_index = self.pool.len();
         }
+    }
+
+    fn append_to_pool(&self) {
+        let path = self.pool_file.clone();
+        let input = self.input.clone();
+
+        thread::spawn(move || {
+            let _ = writeln!(
+                File::options().append(true).open(path).unwrap(),
+                "{}",
+                input
+            );
+        });
+    }
+
+    // We already use a thread to append each command, this might not be necesary
+    //fn save_temp_pool(&self) {
+    //    let mut file = File::options().append(true).open(self.pool_file.as_path()).unwrap();
+    //    for entry in &self.pool[self.loaded_pool_index..self.pool.len()] {
+    //        writeln!(&mut file, "{}", entry).unwrap();
+    //    }
+    //}
+
+    fn change_state(&mut self, new_state: InputState) {
+        // first, append all new pool entries
+        //self.save_temp_pool();
+        self.state = new_state;
+        self.pool_file.pop();
+        let _ = create_dir_all(self.pool_file.as_path());
+        self.pool_file.push(self.state.filename());
+        self.read_history_file();
+    }
+
+    fn read_history_file(&mut self) {
+        if !self.pool_file.exists() {
+            let _ = File::create_new(self.pool_file.as_path());
+        }
+        let file = File::open(self.pool_file.as_path()).expect("Failed to open input file");
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = line.expect("Failed to read line!");  // each line is a Result<String, io::Error>
+            log::info!("Line: {}", line);
+            self.pool.push(line);
+            self.pool_index += 1;
+        }
+        self.loaded_pool_index = self.pool.len();
     }
 
     /////////// RATATUI ////////////
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        self.read_history_file();
         while !self.exit {                              // App loop
             //log::info!("{}", terminal.size().unwrap());
             terminal.draw(|frame| {
@@ -200,6 +295,11 @@ impl App {
             self.handle_events()?;                      // handle key presses
         }
         Ok(())
+    }
+
+    fn init(&mut self) {
+        self.change_state(InputState::Text);
+        self.read_history_file();
     }
 
     fn draw(&self, frame: &mut Frame) {
@@ -256,6 +356,8 @@ impl App {
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Delete => self.delete(),
+            KeyCode::Up => self.up(),
+            KeyCode::Down => self.down(),
             KeyCode::Left => self.left(),
             KeyCode::Right => self.right(),
             KeyCode::Home => self.home(),
